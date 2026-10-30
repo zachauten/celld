@@ -121,6 +121,8 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Testing](testing.md)
 - [WebAssembly](wasm.md)
 - [Python Workers](services/workers.md#python-workers)
+- [SIP High-Level Architecture](sip-high-level-architecture.md)
+- [SIP Test-Driven Implementation Plan](sip-implementation-plan.md)
 
 ## Services
 

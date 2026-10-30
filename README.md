@@ -57,6 +57,7 @@ fleet bucket. Each row links to a project that deploys as-is:
 | Dynamic Workers: runtime-loaded code and Tail Worker observability | [`dynamic-worker-tails`](examples/dynamic-worker-tails) |
 | Containers (experimental): a Durable Object that supervises a container, `@cloudflare/containers` | [`container`](examples/container) |
 | Sandboxes: the Cloudflare Sandbox SDK, `@cloudflare/sandbox`, on a container per sandbox | [`sandbox`](examples/sandbox) |
+| SIP: serverless RFC 3261 signaling, B2BUA Durable Objects, Digest Auth | [`sip-pbx`](examples/sip-pbx) |
 
 A product that needs the Cloudflare network, a GPU, or a browser farm is out
 of scope. The [Cloudflare compatibility](docs/cloudflare-compat.md) page
