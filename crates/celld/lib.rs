@@ -92,6 +92,8 @@ pub mod r2_cli;
 pub(crate) mod r2_store;
 pub mod replication;
 pub mod runtime;
+pub mod sip_media;
+pub mod sip_transport;
 pub mod startup;
 pub mod storage;
 pub mod telemetry;
@@ -263,6 +265,13 @@ pub enum WorkerJob {
         queued_at: std::time::Instant,
         batch: js::QueueBatch,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::QueueDispatchResult>>,
+    },
+    Sip {
+        queued_at: std::time::Instant,
+        entrypoint: Option<String>,
+        request: Box<engine_api::RuntimeSipRequest>,
+        provisional_sender: Option<tokio::sync::mpsc::UnboundedSender<engine_api::RuntimeSipResponse>>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<engine_api::RuntimeSipResponse>>,
     },
 }
 

@@ -323,8 +323,23 @@ pub fn enter_call_order(caller: Arc<IoContext>, cell: &str) -> CallOrder {
     }
 }
 
+static DO_CALL_HOOK: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<DoCallReq>>> =
+    std::sync::RwLock::new(None);
+
 pub fn set_do_call_tx(tx: tokio::sync::mpsc::UnboundedSender<DoCallReq>) {
-    let _ = DO_CALL_TX.set(tx);
+    let mut hook = DO_CALL_HOOK.write().unwrap();
+    *hook = Some(tx);
+    if DO_CALL_TX.get().is_none() {
+        let (master_tx, mut master_rx) = tokio::sync::mpsc::unbounded_channel::<DoCallReq>();
+        let _ = DO_CALL_TX.set(master_tx);
+        asyncrt::spawn(async move {
+            while let Some(req) = master_rx.recv().await {
+                if let Some(target) = DO_CALL_HOOK.read().unwrap().as_ref() {
+                    let _ = target.send(req);
+                }
+            }
+        });
+    }
 }
 
 /// Hand a Durable Object call to the dispatcher. Public HTTP ingress uses the
@@ -332,6 +347,9 @@ pub fn set_do_call_tx(tx: tokio::sync::mpsc::UnboundedSender<DoCallReq>) {
 /// ownership, forward, and redispatch by one policy rather than two.
 #[must_use]
 pub fn submit_do_call(call: DoCallReq) -> bool {
+    if let Some(hook) = DO_CALL_HOOK.read().unwrap().as_ref() {
+        return hook.send(call).is_ok();
+    }
     DO_CALL_TX.get().is_some_and(|tx| tx.send(call).is_ok())
 }
 
@@ -2934,6 +2952,7 @@ pub enum Answer {
     Ack(tokio::sync::oneshot::Sender<Result<Option<u64>>>),
     /// An alarm, which answers whatever alarm the handler left armed.
     Alarm(tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>),
+    Sip(tokio::sync::oneshot::Sender<Result<crate::engine_api::RuntimeSipResponse>>),
 }
 
 /// The invocation data that becomes one Tail Worker event after all referenced
@@ -3044,6 +3063,7 @@ impl Answer {
             Answer::WsMessage(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Ack(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Alarm(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::Sip(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
         }
     }
 }
@@ -3461,6 +3481,10 @@ impl InFlight {
                     reply,
                     self.write_delta().map(|write| (alarm, write)),
                 )
+            }
+            Answer::Sip(reply) => {
+                let read = read_sip_response(tc, value);
+                send_and_end(tc, &self.context, reply, read)
             }
         };
         self.background = background;
@@ -4199,7 +4223,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Sip { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4537,6 +4561,15 @@ fn begin<'s>(
         }
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
+        }
+        crate::WorkerJob::Sip {
+            entrypoint,
+            request,
+            provisional_sender,
+            reply,
+            ..
+        } => {
+            return begin_sip(tc, entrypoint, *request, provisional_sender, reply);
         }
         job => job,
     };
@@ -4977,6 +5010,139 @@ fn begin_queue(
             Begun::Nothing
         }
     }
+}
+
+fn begin_sip(
+    tc: &mut v8::PinScope,
+    entrypoint: Option<String>,
+    request: crate::engine_api::RuntimeSipRequest,
+    provisional_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::engine_api::RuntimeSipResponse>>,
+    reply: tokio::sync::oneshot::Sender<Result<crate::engine_api::RuntimeSipResponse>>,
+) -> Begun {
+    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
+
+    let request_id = request.id;
+    if let Some(sender) = provisional_sender {
+        register_sip_provisional_sender(request_id, sender);
+    }
+
+    let started = (|| {
+        let dispatch = internal_function(tc, "__dispatchEntrypointSip")?;
+        let req_json = serde_json::to_string(&request)
+            .map_err(|e| anyhow!("failed to serialize RuntimeSipRequest: {e}"))?;
+        let req_str = v8::String::new(tc, &req_json).unwrap();
+        let entrypoint_str = v8::String::new(tc, entrypoint.as_deref().unwrap_or("default")).unwrap();
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = dispatch
+            .call(tc, recv, &[entrypoint_str.into(), req_str.into()])
+            .ok_or_else(|| anyhow!("sip dispatch threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: Some(request_id),
+                active_request_id: None,
+                reply: Some(Answer::Sip(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+                tail_report: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            unregister_sip_provisional_sender(request_id);
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+fn read_sip_response<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<crate::engine_api::RuntimeSipResponse> {
+    let f = internal_function(scope, "__readSipResponse")?;
+    let recv = v8::undefined(scope).into();
+    let out = f
+        .call(scope, recv, &[value])
+        .ok_or_else(|| anyhow!("readSipResponse threw"))?;
+    if out.is_promise() {
+        return Err(anyhow!("__readSipResponse returned a promise"));
+    }
+    let out = out.to_object(scope).ok_or_else(|| anyhow!("sip response is not an object"))?;
+    let sk = v8::String::new(scope, "status").unwrap();
+    let rk = v8::String::new(scope, "reason").unwrap();
+    let hk = v8::String::new(scope, "headersJson").unwrap();
+    let ck = v8::String::new(scope, "contactsJson").unwrap();
+    let bk = v8::String::new(scope, "bodyBytes").unwrap();
+
+    let status = out
+        .get(scope, sk.into())
+        .and_then(|v| v.uint32_value(scope))
+        .unwrap_or(200) as u16;
+    let reason = out
+        .get(scope, rk.into())
+        .and_then(|v| if v.is_string() { Some(v.to_rust_string_lossy(scope)) } else { None })
+        .unwrap_or_else(|| if status == 200 { "OK".to_string() } else { "".to_string() });
+    let headers_json = out
+        .get(scope, hk.into())
+        .and_then(|v| if v.is_string() { Some(v.to_rust_string_lossy(scope)) } else { None })
+        .unwrap_or_else(|| "[]".to_string());
+    let contacts_json = out
+        .get(scope, ck.into())
+        .and_then(|v| if v.is_string() { Some(v.to_rust_string_lossy(scope)) } else { None })
+        .unwrap_or_else(|| "[]".to_string());
+    let body = out
+        .get(scope, bk.into())
+        .and_then(|v| v8::Local::<v8::ArrayBufferView>::try_from(v).ok())
+        .map(|view| {
+            let mut buf = vec![0u8; view.byte_length()];
+            view.copy_contents(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+
+    let headers: Vec<(String, String)> = serde_json::from_str(&headers_json).unwrap_or_default();
+    let contacts: Vec<String> = serde_json::from_str(&contacts_json).unwrap_or_default();
+
+    Ok(crate::engine_api::RuntimeSipResponse {
+        status,
+        reason,
+        headers,
+        body,
+        contacts,
+        write_position: None,
+        observed_position: None,
+    })
 }
 
 /// for the JSON flavor, a `Uint8Array` for structured clone.
@@ -5799,12 +5965,12 @@ impl Worker {
     ///
     /// The runtime builds a `WorkerConfig` directly. This cfg-gated helper
     /// constructs the same value from individual options.
-    #[cfg(celld_internal_tests)]
     pub fn load(options: WorkerConfigOptions) -> Result<Worker> {
         Self::load_config(Arc::new(WorkerConfig::new(options)))
     }
 
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
+        Engine::init();
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
@@ -5998,6 +6164,17 @@ impl Worker {
                 !config.declares_queue_consumer || has_queue_handler,
                 "queue consumer has no queue handler"
             );
+            let sk = v8::String::new(scope, "sip").unwrap();
+            let own_sip = default
+                .get(scope, sk.into())
+                .is_some_and(|handler| handler.is_function());
+            let class_sip = default_is_entrypoint
+                && default
+                    .get(scope, v8::String::new(scope, "prototype").unwrap().into())
+                    .and_then(|prototype| prototype.to_object(scope))
+                    .and_then(|prototype| prototype.get(scope, sk.into()))
+                    .is_some_and(|handler| handler.is_function());
+            let has_sip_handler = own_sip || class_sip;
             let f: v8::Local<v8::Function> = if fetch_value.is_function() {
                 fetch_value.try_into().expect("function casts to Function")
             } else if default_is_entrypoint && class_fetch {
@@ -6015,13 +6192,10 @@ impl Worker {
                     "the default export is a Durable Object class; export a fetch \
                      handler or a WorkerEntrypoint class as the default"
                 ));
-            } else if config.declares_queue_consumer {
-                // A push-consumer Worker needs no HTTP handler. Keep the
+            } else if config.declares_queue_consumer || has_sip_handler {
+                // A push-consumer or SIP Worker needs no HTTP handler. Keep the
                 // stateless pool's fetch slot total, but fail closed if this
-                // deployment becomes the fleet's HTTP entry point. Test the
-                // prototype above before the entrypoint fallback below: a
-                // queue-only class is still a registered entrypoint, but
-                // routing fetch through it throws instead of returning 404.
+                // deployment becomes the fleet's HTTP entry point.
                 compile_fn(scope, "() => new Response('Not found', { status: 404 })")?
             } else if default_is_entrypoint {
                 // Preserve an RPC-only default entrypoint. Its HTTP path
@@ -6890,6 +7064,10 @@ ops! { OP_NAMES, install_op_functions,
         "__zlib_stream_push" => zlib::op_zlib_stream_push,
         "__zlib_stream_end" => zlib::op_zlib_stream_end,
         "__zlib_stream_drop" => zlib::op_zlib_stream_drop,
+        "__sip_send_provisional" => op_sip_send_provisional,
+        "__sip_digest_verify" => op_sip_digest_verify,
+        "__sip_compute_ha1" => op_sip_compute_ha1,
+        "__sip_generate_challenge" => op_sip_generate_challenge,
 }
 
 #[cfg(celld_internal_tests)]
@@ -12472,6 +12650,133 @@ fn op_text_decoder_free(
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
     text_decoders(scope).remove(&id);
+}
+
+static SIP_PROVISIONAL_SENDERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u128, tokio::sync::mpsc::UnboundedSender<crate::engine_api::RuntimeSipResponse>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub fn register_sip_provisional_sender(
+    id: u128,
+    sender: tokio::sync::mpsc::UnboundedSender<crate::engine_api::RuntimeSipResponse>,
+) {
+    SIP_PROVISIONAL_SENDERS.lock().unwrap().insert(id, sender);
+}
+
+pub fn unregister_sip_provisional_sender(id: u128) {
+    SIP_PROVISIONAL_SENDERS.lock().unwrap().remove(&id);
+}
+
+pub fn send_sip_provisional(
+    id: u128,
+    resp: crate::engine_api::RuntimeSipResponse,
+) -> Result<(), String> {
+    if let Some(sender) = SIP_PROVISIONAL_SENDERS.lock().unwrap().get(&id) {
+        sender
+            .send(resp)
+            .map_err(|e| format!("provisional response channel closed: {e}"))
+    } else {
+        Err(format!("no active provisional sender for request {id}"))
+    }
+}
+
+fn op_sip_send_provisional(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let req_id_str = args.get(0).to_rust_string_lossy(scope);
+    let req_id = match req_id_str.parse::<u128>() {
+        Ok(id) => id,
+        Err(_) => {
+            let msg = v8::String::new(scope, "invalid request id for provisional response").unwrap();
+            let exc = v8::Exception::type_error(scope, msg);
+            scope.throw_exception(exc);
+            return;
+        }
+    };
+    let status = args.get(1).uint32_value(scope).unwrap_or(180) as u16;
+    let reason = args.get(2).to_rust_string_lossy(scope);
+    let headers_json = args.get(3).to_rust_string_lossy(scope);
+    let contacts_json = args.get(4).to_rust_string_lossy(scope);
+
+    let body = if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(5)) {
+        let mut buf = vec![0u8; view.byte_length()];
+        view.copy_contents(&mut buf);
+        buf
+    } else {
+        Vec::new()
+    };
+
+    let headers: Vec<(String, String)> = serde_json::from_str(&headers_json).unwrap_or_default();
+    let contacts: Vec<String> = serde_json::from_str(&contacts_json).unwrap_or_default();
+
+    let resp = crate::engine_api::RuntimeSipResponse {
+        status,
+        reason,
+        headers,
+        body,
+        contacts,
+        write_position: None,
+        observed_position: None,
+    };
+
+    if let Err(err) = send_sip_provisional(req_id, resp) {
+        let msg = v8::String::new(scope, &err).unwrap();
+        let exc = v8::Exception::error(scope, msg);
+        scope.throw_exception(exc);
+    }
+}
+
+fn op_sip_digest_verify(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let auth_hdr = args.get(0).to_rust_string_lossy(scope);
+    let method = args.get(1).to_rust_string_lossy(scope);
+    let ha1_hex = args.get(2).to_rust_string_lossy(scope);
+
+    let verified = crate::engine_api::verify_sip_digest(&auth_hdr, &method, &ha1_hex).unwrap_or(false);
+    rv.set(v8::Boolean::new(scope, verified).into());
+}
+
+fn op_sip_compute_ha1(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let algo_str = args.get(0).to_rust_string_lossy(scope);
+    let username = args.get(1).to_rust_string_lossy(scope);
+    let realm = args.get(2).to_rust_string_lossy(scope);
+    let password = args.get(3).to_rust_string_lossy(scope);
+
+    let algo = match algo_str.to_ascii_uppercase().as_str() {
+        "SHA-256" | "SHA256" => celld_logic::sip::DigestAlgorithm::Sha256,
+        _ => celld_logic::sip::DigestAlgorithm::Md5,
+    };
+
+    let ha1 = crate::engine_api::compute_sip_ha1(algo, &username, &realm, &password);
+    rv.set(v8::String::new(scope, &ha1).unwrap().into());
+}
+
+fn op_sip_generate_challenge(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let realm = args.get(0).to_rust_string_lossy(scope);
+    let nonce = args.get(1).to_rust_string_lossy(scope);
+    let algo_str = args.get(2).to_rust_string_lossy(scope);
+    let qop_auth = args.get(3).is_true();
+
+    let algo = match algo_str.to_ascii_uppercase().as_str() {
+        "SHA-256" | "SHA256" => celld_logic::sip::DigestAlgorithm::Sha256,
+        _ => celld_logic::sip::DigestAlgorithm::Md5,
+    };
+
+    let challenge = crate::engine_api::generate_sip_challenge(&realm, &nonce, algo, qop_auth);
+    rv.set(v8::String::new(scope, &challenge).unwrap().into());
 }
 
 // ---- the JS harness: Web API + the DO object model ----

@@ -447,6 +447,8 @@ pub enum Channel {
     /// recovery path it still needs. So the promise takes the same ticket an
     /// egress takes, and its release is the promise settling.
     Sync,
+    /// A SIP egress wire packet or forked leg request leaving a Durable Object cell.
+    SipEgress,
 }
 
 impl Channel {
@@ -463,6 +465,7 @@ impl Channel {
             Channel::Tcp => "tcp",
             Channel::Queue => "queue",
             Channel::Sync => "sync",
+            Channel::SipEgress => "sip_egress",
         }
     }
 }

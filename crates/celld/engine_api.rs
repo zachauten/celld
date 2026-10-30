@@ -283,6 +283,7 @@ pub enum ModuleSource {
 
 /// A Workflow binding keeps the three names distinct across deployment
 /// loading, environment construction, and runtime class injection.
+#[derive(Clone)]
 pub struct WorkflowBinding {
     pub environment: String,
     pub workflow: String,
@@ -297,6 +298,7 @@ pub struct QueueBinding {
     pub delivery_delay: u32,
 }
 
+#[derive(Clone)]
 pub struct WorkerConfigOptions {
     pub src: String,
     pub script_name: String,
@@ -312,6 +314,27 @@ pub struct WorkerConfigOptions {
     pub node: String,
     pub modules: Vec<(String, ModuleSource)>,
     pub compat: Compat,
+}
+
+impl Default for WorkerConfigOptions {
+    fn default() -> Self {
+        Self {
+            src: String::new(),
+            script_name: "test".to_string(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "node-1".to_string(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        }
+    }
 }
 
 /// A handler that failed inside its turn, with the positions that turn
@@ -881,3 +904,161 @@ pub fn handler_budget() -> std::time::Duration {
         )
     })
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RealDigestHasher;
+
+impl celld_logic::sip::DigestHasher for RealDigestHasher {
+    fn hash_md5_hex(&self, data: &[u8]) -> String {
+        use md5::{Digest, Md5};
+        format!("{:x}", Md5::digest(data))
+    }
+    fn hash_sha256_hex(&self, data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(data))
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeSipRequest {
+    pub id: u128,
+    pub method: String,
+    pub uri: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub transport_protocol: String,
+    pub source_address: String,
+    pub destination_address: Option<String>,
+    pub node_id: String,
+    pub listener_id: Option<String>,
+    pub call_id: String,
+    pub cseq_num: u32,
+    pub cseq_method: String,
+    pub from: String,
+    pub to: String,
+    pub contacts: Vec<String>,
+    pub max_forwards: u8,
+    pub expires: Option<u32>,
+}
+
+impl RuntimeSipRequest {
+    pub fn from_request(id: RequestId, req: &celld_logic::sip::SipRequestData) -> Self {
+        Self {
+            id,
+            method: req.method.clone(),
+            uri: req.uri.to_string(),
+            version: req.version.clone(),
+            headers: req.headers.clone(),
+            body: req.body.clone(),
+            transport_protocol: match req.transport.protocol {
+                celld_logic::sip::SipProtocol::Udp => "udp".to_string(),
+                celld_logic::sip::SipProtocol::Tcp => "tcp".to_string(),
+                celld_logic::sip::SipProtocol::Tls => "tls".to_string(),
+                celld_logic::sip::SipProtocol::Ws => "ws".to_string(),
+            },
+            source_address: req.transport.source_address.clone(),
+            destination_address: req.transport.destination_address.clone(),
+            node_id: req.transport.node_id.clone(),
+            listener_id: req.transport.listener_id.clone(),
+            call_id: req.call_id.clone(),
+            cseq_num: req.cseq.0,
+            cseq_method: req.cseq.1.clone(),
+            from: req.from.to_string(),
+            to: req.to.to_string(),
+            contacts: req.contacts.iter().map(|c| c.to_string()).collect(),
+            max_forwards: req.max_forwards,
+            expires: req.expires,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeSipResponse {
+    pub status: u16,
+    pub reason: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub contacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_position: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_position: Option<u64>,
+}
+
+impl RuntimeSipResponse {
+    pub fn to_sip_response(
+        &self,
+        req: &celld_logic::sip::SipRequestData,
+        to_tag: Option<&str>,
+    ) -> Result<celld_logic::sip::SipResponseData, celld_logic::sip::ParseError> {
+        let mut to = req.to.clone();
+        if let Some(tag) = to_tag {
+            to.tag = Some(tag.to_string());
+        }
+        let mut contacts = Vec::new();
+        for c in &self.contacts {
+            contacts.push(celld_logic::sip::SipContact::parse(c)?);
+        }
+        Ok(celld_logic::sip::SipResponseData {
+            status: self.status,
+            reason: self.reason.clone(),
+            version: req.version.clone(),
+            vias: req.vias.clone(),
+            from: req.from.clone(),
+            to,
+            call_id: req.call_id.clone(),
+            cseq: req.cseq.clone(),
+            contacts,
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+        })
+    }
+}
+
+/// Helper to verify Digest Authentication using `RealDigestHasher`.
+pub fn verify_sip_digest(
+    auth_hdr: &str,
+    method: &str,
+    ha1_hex: &str,
+) -> Result<bool, String> {
+    let creds = celld_logic::sip::DigestCredentials::parse(auth_hdr)
+        .ok_or_else(|| "failed to parse digest credentials".to_string())?;
+    let verdict = celld_logic::sip::verify_digest(
+        &creds,
+        method,
+        ha1_hex,
+        &RealDigestHasher,
+    );
+    Ok(verdict == celld_logic::sip::DigestVerdict::Verified)
+}
+
+/// Helper to compute HA1 hex given username, realm, and password.
+pub fn compute_sip_ha1(
+    algorithm: celld_logic::sip::DigestAlgorithm,
+    username: &str,
+    realm: &str,
+    password: &str,
+) -> String {
+    use celld_logic::sip::DigestHasher;
+    let data = format!("{username}:{realm}:{password}");
+    match algorithm {
+        celld_logic::sip::DigestAlgorithm::Md5 => {
+            RealDigestHasher.hash_md5_hex(data.as_bytes())
+        }
+        celld_logic::sip::DigestAlgorithm::Sha256 => {
+            RealDigestHasher.hash_sha256_hex(data.as_bytes())
+        }
+    }
+}
+
+/// Helper to generate a Digest challenge header.
+pub fn generate_sip_challenge(
+    realm: &str,
+    nonce: &str,
+    algorithm: celld_logic::sip::DigestAlgorithm,
+    qop_auth: bool,
+) -> String {
+    celld_logic::sip::format_digest_challenge(realm, nonce, algorithm, qop_auth)
+}
+

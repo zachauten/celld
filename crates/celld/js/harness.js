@@ -2601,6 +2601,12 @@ class DurableObjectState {
     // the `@cloudflare/containers` constructor checks.
     if (__cell.containers[className]) this.container = new Container(scope);
   }
+  get sip() {
+    if (!this._sipCtx) {
+      this._sipCtx = globalThis.CellSipContext ? new globalThis.CellSipContext(this) : null;
+    }
+    return this._sipCtx;
+  }
   // Workerd's DurableObjectState.exports (actor-state.h): the same
   // loopback surface as ctx.exports on stateless entrypoints.
   get exports() { return __ctxExports(); }
@@ -5260,10 +5266,53 @@ class DurableObjectNamespace {
             : undefined,
         });
     };
+    const doSip = async (input) => {
+      let rawReq;
+      if (input && typeof input.toJSON === "function") {
+        rawReq = input.toJSON();
+      } else if (input && typeof input === "object") {
+        rawReq = input;
+      } else {
+        throw new TypeError("stub.sip() requires a SipRequest or request options object");
+      }
+      const headersJson = JSON.stringify([["x-celld-sip-req", JSON.stringify(rawReq)]]);
+      const r = JSON.parse(await invoke(() => {
+        return __do_call(
+          scope, dispatchName ?? null, "http://cell.internal/sip", "SIP",
+          new Uint8Array(0), headersJson, undefined,
+        );
+      }));
+      const body = r.body !== undefined
+        ? r.body
+        : Uint8Array.from(r.bodyBytes || []);
+      let status = 200;
+      let reason = "OK";
+      let contacts = [];
+      const headers = [];
+      if (Array.isArray(r.headers)) {
+        for (const [k, v] of r.headers) {
+          if (k.toLowerCase() === "x-celld-sip-status") {
+            status = Number(v);
+          } else if (k.toLowerCase() === "x-celld-sip-reason") {
+            reason = v;
+          } else if (k.toLowerCase() === "x-celld-sip-contacts") {
+            try { contacts = JSON.parse(v); } catch (_) {}
+          } else {
+            headers.push([k, v]);
+          }
+        }
+      }
+      return new globalThis.SipResponse(status, reason, {
+        headers,
+        contacts,
+        body,
+      });
+    };
     const stub = new Proxy(target, { get: (_target, prop) => {
       if (prop === "then") return undefined;
       if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
       if (prop === "fetch") return doFetch;
+      if (prop === "sip") return doSip;
       if (typeof prop !== "string") return undefined;
       if (__cell.compat.fetcherGetPutDelete &&
           (prop === "get" || prop === "put" || prop === "delete"))
@@ -5358,6 +5407,38 @@ const __dispatchTo = __celld.__dispatchTo = async (
   try {
     const dispatch = (async () => {
       const inst = await _readyInstance(scope);
+      if (method === "SIP") {
+        if (typeof inst.sip !== "function") {
+          throw new TypeError("Durable Object does not implement a sip() handler");
+        }
+        let parsedHeaders = [];
+        try {
+          parsedHeaders = typeof headersJson === "string" ? JSON.parse(headersJson) : headersJson;
+        } catch (_) {}
+        let sipReqData = null;
+        if (Array.isArray(parsedHeaders)) {
+          for (const item of parsedHeaders) {
+            if (Array.isArray(item) && item[0] && item[0].toLowerCase() === "x-celld-sip-req") {
+              try { sipReqData = JSON.parse(item[1]); } catch (_) {}
+              break;
+            }
+          }
+        }
+        if (!sipReqData) {
+          sipReqData = typeof headersJson === "string" ? JSON.parse(headersJson) : headersJson;
+        }
+        const sipReq = new globalThis.SipRequest(sipReqData);
+        const resp = await __ctxRun(undefined, () => inst.sip(sipReq));
+        const readResp = __celld.__readSipResponse(resp);
+        const respHeaders = JSON.parse(readResp.headersJson);
+        respHeaders.push(["X-Celld-Sip-Status", String(readResp.status)]);
+        respHeaders.push(["X-Celld-Sip-Reason", readResp.reason]);
+        respHeaders.push(["X-Celld-Sip-Contacts", readResp.contactsJson]);
+        return new Response(readResp.bodyBytes, {
+          status: 200,
+          headers: respHeaders,
+        });
+      }
       return await __ctxRun(undefined, () => inst.fetch(
         __makeRequest(
           url,
@@ -5542,6 +5623,7 @@ const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
       ? undefined : __sc_decode(propsSc));
 __celld.__dispatchEntrypointScheduled = (name, ctrl) =>
   __dispatchEntrypointMethod(name, "scheduled", ctrl);
+__celld.__dispatchEntrypointMethod = __dispatchEntrypointMethod;
 // A queue batch owns mutable settlement state only while its handler runs.
 // Keeping a batch alive after dispatch must not keep authority to settle its
 // lease, because that lease can have expired and been handed out again.

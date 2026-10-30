@@ -31,6 +31,8 @@ pub mod rebalance;
 pub mod restore;
 pub mod routing;
 pub mod schedule;
+pub mod sip;
+pub mod rtpengine;
 pub mod sqlite;
 pub mod sweep;
 pub mod wake;

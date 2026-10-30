@@ -48,6 +48,7 @@ static_source!(CACHE_SOURCE, "cache.js");
 static_source!(SOCKETS_SOURCE, "sockets.js");
 static_source!(HTML_REWRITER_SOURCE, "html_rewriter.js");
 static_source!(CRYPTO_SOURCE, "crypto.js");
+static_source!(SIP_SOURCE, "sip.js");
 
 static PRELUDE: &[BootstrapSource] = &[
     BootstrapSource {
@@ -108,6 +109,10 @@ static POST_HARNESS: &[BootstrapSource] = &[
     BootstrapSource {
         name: "crypto.js",
         source: &CRYPTO_SOURCE,
+    },
+    BootstrapSource {
+        name: "sip.js",
+        source: &SIP_SOURCE,
     },
 ];
 

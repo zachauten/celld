@@ -46,6 +46,9 @@ pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
 
+pub(crate) const SIP_DEST_HEADER: &str = "x-cells-sip-dest";
+pub(crate) const SIP_PROTOCOL_HEADER: &str = "x-cells-sip-protocol";
+
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
 /// is dropped rather than obeyed.
@@ -54,6 +57,7 @@ const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER
 enum TunnelKind {
     Do,
     Rpc,
+    SipEgress,
 }
 
 /// The control fields of one tunneled call, carried as inner-request headers
@@ -121,6 +125,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
     {
         Some(b"do") => TunnelKind::Do,
         Some(b"rpc") => TunnelKind::Rpc,
+        Some(b"sip-egress") => TunnelKind::SipEgress,
         _ => {
             return peer_response(response(StatusCode::BAD_REQUEST, "unknown tunnel kind"));
         }
@@ -134,6 +139,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
         match kind {
             TunnelKind::Do => serve_do(upgraded, app).await,
             TunnelKind::Rpc => serve_rpc(upgraded, app).await,
+            TunnelKind::SipEgress => serve_sip_egress(upgraded).await,
         }
     });
     let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
@@ -746,6 +752,50 @@ where
             return false;
         }
     }
+}
+
+async fn serve_sip_egress(upgraded: hyper::upgrade::Upgraded) {
+    let service = service_fn(move |inner: Request<Incoming>| {
+        async move {
+            let Some(dest) = inner
+                .headers()
+                .get(SIP_DEST_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            else {
+                return Ok::<_, Infallible>(peer_response(response(
+                    StatusCode::BAD_REQUEST,
+                    "SIP egress destination header is missing",
+                )));
+            };
+            let protocol = inner
+                .headers()
+                .get(SIP_PROTOCOL_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("udp")
+                .to_string();
+
+            let body =
+                match collect_limited_body(inner.into_body(), MAX_PEER_FORWARD_BODY_BYTES).await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return Ok(peer_response(body_read_error("tunnel SIP egress", error)));
+                    }
+                };
+
+            let outcome = celld::sip_transport::send_egress(&dest, &protocol, &body).await;
+            match outcome {
+                Ok(()) => Ok(peer_response(response(StatusCode::OK, ""))),
+                Err(err) => Ok(peer_response(response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to send SIP egress: {err}"),
+                ))),
+            }
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(upgraded, service)
+        .await;
 }
 
 type TunnelBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;

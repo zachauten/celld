@@ -3974,7 +3974,8 @@ impl Actor {
                     | Channel::R2
                     | Channel::Tcp
                     | Channel::Queue
-                    | Channel::Sync => {
+                    | Channel::Sync
+                    | Channel::SipEgress => {
                         if let Some(reply) = self.gated_responses.remove(&held) {
                             let _ = reply.send(result);
                         }

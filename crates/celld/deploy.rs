@@ -19,7 +19,8 @@ use crate::protocol::{
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
     FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    FEATURE_SIP_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    SipManifestConfig,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -58,6 +59,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "r2_buckets",
     "worker_loaders",
     "containers",
+    "sip",
     "no_bundle",
     "define",
     "rules",
@@ -319,6 +321,7 @@ struct Project {
     has_queues: bool,
     has_r2: bool,
     containers: Vec<ContainerDecl>,
+    sip: Option<SipManifestConfig>,
     /// Set when `main` is a `.py` file: the Python behavior its
     /// compatibility date and flags select.
     python: Option<python::PythonCompat>,
@@ -700,6 +703,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         crons: project.crons.clone(),
         containers: container_specs.clone(),
         fence_image: fence_image.clone(),
+        sip: project.sip.clone(),
         queue_consumers: project.queue_consumers,
         // Each capability the manifest depends on is named here, so a node
         // that predates it rejects the deployment up front instead of
@@ -738,6 +742,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if python_runtime {
                 features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
+            }
+            if project.sip.is_some() {
+                features.push(FEATURE_SIP_V1.to_string());
             }
             features
         },
@@ -1995,6 +2002,20 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     }
 
     let containers = read_containers(object, &do_classes, &sqlite_classes)?;
+    let sip: Option<SipManifestConfig> = match object.get("sip") {
+        None => None,
+        Some(value) => {
+            let sip_config: SipManifestConfig = serde_json::from_value(value.clone())
+                .context("config `sip` has invalid syntax")?;
+            let logic_config = sip_config.to_logic_config()?;
+            celld_logic::sip::validate_config(&logic_config)
+                .map_err(|e| anyhow!("invalid SIP configuration: {e}"))?;
+            if main.is_none() {
+                bail!("config declares `sip` without `main`; a SIP deployment requires a Worker module with a sip() handler");
+            }
+            Some(sip_config)
+        }
+    };
     Ok(Project {
         script_name,
         no_bundle,
@@ -2011,6 +2032,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
         containers,
+        sip,
         python,
     })
 }
@@ -3040,4 +3062,91 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deploy_sip_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("index.js"), "export default { async sip() {} };").unwrap();
+
+        let wrangler = r#"{
+            "name": "sip-server",
+            "main": "index.js",
+            "sip": {
+                "domains": ["sip.example.com"],
+                "listeners": [
+                    { "protocol": "udp", "port": 5060 },
+                    { "protocol": "tcp", "port": 5060 }
+                ],
+                "auto_100_trying": true
+            }
+        }"#;
+        let config_path = root.join("wrangler.jsonc");
+        std::fs::write(&config_path, wrangler).unwrap();
+
+        let project = read_project(&config_path, root, &VarOverrides::None).unwrap();
+        assert!(project.sip.is_some());
+        let sip = project.sip.as_ref().unwrap();
+        assert_eq!(sip.domains, vec!["sip.example.com"]);
+        assert_eq!(sip.listeners.len(), 2);
+        assert!(sip.auto_100_trying);
+    }
+
+    #[test]
+    fn test_deploy_sip_without_main_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        std::fs::write(root.join("public").join("index.html"), "<h1>Hello</h1>").unwrap();
+
+        let wrangler = r#"{
+            "name": "sip-server",
+            "assets": {
+                "directory": "public"
+            },
+            "sip": {
+                "domains": ["sip.example.com"],
+                "listeners": [
+                    { "protocol": "udp", "port": 5060 }
+                ]
+            }
+        }"#;
+        let config_path = root.join("wrangler.jsonc");
+        std::fs::write(&config_path, wrangler).unwrap();
+
+        match read_project(&config_path, root, &VarOverrides::None) {
+            Ok(_) => panic!("expected rejection for sip without main"),
+            Err(err) => assert!(err.to_string().contains("declares `sip` without `main`")),
+        }
+    }
+
+    #[test]
+    fn test_deploy_sip_invalid_config_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("index.js"), "export default {};").unwrap();
+
+        let wrangler = r#"{
+            "name": "sip-server",
+            "main": "index.js",
+            "sip": {
+                "domains": ["sip.example.com"],
+                "listeners": [
+                    { "protocol": "tls", "port": 5061 }
+                ]
+            }
+        }"#;
+        let config_path = root.join("wrangler.jsonc");
+        std::fs::write(&config_path, wrangler).unwrap();
+
+        match read_project(&config_path, root, &VarOverrides::None) {
+            Ok(_) => panic!("expected rejection for invalid sip config"),
+            Err(err) => assert!(err.to_string().contains("tls listener requires cert path")),
+        }
+    }
 }

@@ -198,7 +198,9 @@ impl StatelessWorkerJob {
             crate::WorkerJob::Fetch { request_id, .. } => {
                 request_id.map(RequestCancellationLifetime::from_request_id)
             }
-            crate::WorkerJob::Rpc { .. } | crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Rpc { .. }
+            | crate::WorkerJob::Queue { .. }
+            | crate::WorkerJob::Sip { .. } => None,
         };
         let cancellation = RequestCancellationGuard::new(lifetime);
         Self { job, cancellation }
@@ -490,6 +492,7 @@ pub enum StatelessVerb {
     Fetch,
     Rpc,
     Queue,
+    Sip,
 }
 
 impl StatelessVerb {
@@ -498,6 +501,7 @@ impl StatelessVerb {
             Self::Fetch => anyhow!("stateless request task died: {error}"),
             Self::Rpc => anyhow!("stateless RPC task died: {error}"),
             Self::Queue => anyhow!("stateless queue task died: {error}"),
+            Self::Sip => anyhow!("stateless SIP task died: {error}"),
         }
     }
 
@@ -506,6 +510,7 @@ impl StatelessVerb {
             Self::Fetch => anyhow!("stateless Worker dropped response"),
             Self::Rpc => anyhow!("stateless Worker dropped RPC result"),
             Self::Queue => anyhow!("stateless Worker dropped queue result"),
+            Self::Sip => anyhow!("stateless Worker dropped SIP result"),
         }
     }
 }
@@ -2639,6 +2644,12 @@ impl StatelessTiming {
                 "celld.fetch",
                 crate::telemetry::KIND_SERVER,
             ),
+            crate::WorkerJob::Sip { queued_at, .. } => (
+                *queued_at,
+                None,
+                "celld.sip",
+                crate::telemetry::KIND_SERVER,
+            ),
         };
         StatelessTiming {
             queued_at,
@@ -2920,6 +2931,25 @@ impl StatelessRuntime {
         self.dispatch(StatelessVerb::Queue, move |reply| crate::WorkerJob::Queue {
             queued_at,
             batch,
+            reply,
+        })
+        .await
+    }
+
+    /// Dispatch one SIP request through the stateless isolate pool.
+    #[doc(hidden)]
+    pub async fn sip(
+        &self,
+        entrypoint: Option<String>,
+        request: crate::engine_api::RuntimeSipRequest,
+        provisional_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::engine_api::RuntimeSipResponse>>,
+    ) -> anyhow::Result<crate::engine_api::RuntimeSipResponse> {
+        let queued_at = Instant::now();
+        self.dispatch(StatelessVerb::Sip, move |reply| crate::WorkerJob::Sip {
+            queued_at,
+            entrypoint,
+            request: Box::new(request),
+            provisional_sender,
             reply,
         })
         .await
