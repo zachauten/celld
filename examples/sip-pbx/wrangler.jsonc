@@ -7,10 +7,11 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["CallSession"] }],
   "sip": {
-    "domain": "sip.example.com",
+    "domains": ["sip.example.com"],
     "listeners": [
-      { "id": "udp-5060", "protocol": "udp", "bind": "0.0.0.0:5060" },
-      { "id": "ws-5060", "protocol": "ws", "bind": "0.0.0.0:8080" }
-    ]
+      { "protocol": "udp", "port": 5060 },
+      { "protocol": "ws", "port": 8080, "path": "/sip" }
+    ],
+    "auto_100_trying": true
   }
 }

@@ -3098,6 +3098,36 @@ mod tests {
     }
 
     #[test]
+    fn test_deploy_sip_project_config_with_bind_and_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("index.js"), "export default { async sip() {} };").unwrap();
+
+        let wrangler = r#"{
+            "name": "sip-server",
+            "main": "index.js",
+            "sip": {
+                "domain": "sip.example.com",
+                "listeners": [
+                    { "id": "udp-5060", "protocol": "udp", "bind": "0.0.0.0:5060" },
+                    { "id": "ws-5060", "protocol": "ws", "bind": "0.0.0.0:8080", "path": "/sip" }
+                ]
+            }
+        }"#;
+        let config_path = root.join("wrangler.jsonc");
+        std::fs::write(&config_path, wrangler).unwrap();
+
+        let project = read_project(&config_path, root, &VarOverrides::None).unwrap();
+        assert!(project.sip.is_some());
+        let sip = project.sip.as_ref().unwrap();
+        assert_eq!(sip.domains, vec!["sip.example.com"]);
+        assert_eq!(sip.listeners.len(), 2);
+        assert_eq!(sip.listeners[0].port, 5060);
+        assert_eq!(sip.listeners[1].port, 8080);
+        assert!(sip.auto_100_trying);
+    }
+
+    #[test]
     fn test_deploy_sip_without_main_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

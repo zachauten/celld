@@ -302,7 +302,7 @@ pub fn validate_queue_manifest(manifest: &Manifest) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SipManifestListener {
     pub protocol: String,
     pub port: u16,
@@ -314,12 +314,93 @@ pub struct SipManifestListener {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for SipManifestListener {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ListenerHelper {
+            protocol: String,
+            port: Option<u16>,
+            bind: Option<String>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            id: Option<String>,
+            #[serde(default)]
+            cert: Option<String>,
+            #[serde(default)]
+            key: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+        }
+
+        let helper = ListenerHelper::deserialize(deserializer)?;
+        let port = helper
+            .port
+            .or_else(|| {
+                helper.bind.as_deref().and_then(|b| {
+                    if let Ok(p) = b.parse::<u16>() {
+                        Some(p)
+                    } else {
+                        b.rsplit(':')
+                            .next()
+                            .and_then(|p| p.parse::<u16>().ok())
+                    }
+                })
+            })
+            .ok_or_else(|| serde::de::Error::missing_field("port"))?;
+
+        Ok(Self {
+            protocol: helper.protocol,
+            port,
+            cert: helper.cert,
+            key: helper.key,
+            path: helper.path,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SipManifestConfig {
     pub domains: Vec<String>,
     pub listeners: Vec<SipManifestListener>,
     #[serde(default = "default_auto_100_trying")]
     pub auto_100_trying: bool,
+}
+
+impl<'de> Deserialize<'de> for SipManifestConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ConfigHelper {
+            #[serde(default)]
+            domains: Option<Vec<String>>,
+            #[serde(default)]
+            domain: Option<String>,
+            #[serde(default)]
+            listeners: Vec<SipManifestListener>,
+            #[serde(default = "default_auto_100_trying")]
+            auto_100_trying: bool,
+        }
+
+        let helper = ConfigHelper::deserialize(deserializer)?;
+        let domains = if let Some(domains) = helper.domains {
+            domains
+        } else if let Some(domain) = helper.domain {
+            vec![domain]
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            domains,
+            listeners: helper.listeners,
+            auto_100_trying: helper.auto_100_trying,
+        })
+    }
 }
 
 fn default_auto_100_trying() -> bool {
