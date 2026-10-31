@@ -298,6 +298,7 @@ pub struct Generation {
     /// See `Manifest::fence_image`; the first script's, they are all the
     /// same image when one celld deployed them.
     pub(crate) fence_image: Option<String>,
+    pub sip: Option<crate::protocol::SipManifestConfig>,
 }
 
 impl Generation {
@@ -506,6 +507,7 @@ impl Generation {
         let prefix = primary.prefix.clone();
         let mut all_containers = Vec::new();
         let mut fence_image = None;
+        let sip = primary.sip.clone();
         // Only classes the user declared can be a bare-id default. Every
         // runtime-supplied class rides in `do_classes` so that its namespace
         // key is minted, and counting one here made adding any D1 binding flip
@@ -625,6 +627,7 @@ impl Generation {
             assets,
             containers: all_containers,
             fence_image,
+            sip,
         })
     }
 }

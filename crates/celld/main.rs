@@ -818,6 +818,112 @@ fn spawn_cron_arm(app: AppHandle) {
     });
 }
 
+fn spawn_sip_listeners(app: AppHandle, node: String) {
+    let Some(runtime) = app.runtime.clone() else {
+        return;
+    };
+    let generation = runtime.generation();
+    let Some(sip_config) = generation.sip.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        for listener_cfg in &sip_config.listeners {
+            if listener_cfg.protocol.eq_ignore_ascii_case("udp") {
+                let bind_addr = format!("0.0.0.0:{}", listener_cfg.port);
+                match celld::sip_transport::SipTransportServer::bind_udp(node.clone(), &bind_addr).await {
+                    Ok(server) => {
+                        let _ = celld::cli_output::Output::new(celld::cli_output::Format::Text).line(format_args!(
+                            "celld SIP UDP listening on {bind_addr}"
+                        ));
+                        let runtime_clone = runtime.clone();
+                        let auto_100 = sip_config.auto_100_trying;
+                        tokio::spawn(async move {
+                            loop {
+                                match server.recv_udp_packet().await {
+                                    Ok((celld_logic::sip::SipMessage::Request(req), src)) => {
+                                        let src_str = src.to_string();
+                                        if auto_100 && req.method == "INVITE" {
+                                            let trying_resp = celld_logic::sip::SipResponseData {
+                                                status: 100,
+                                                reason: "Trying".to_string(),
+                                                version: req.version.clone(),
+                                                vias: req.vias.clone(),
+                                                from: req.from.clone(),
+                                                to: req.to.clone(),
+                                                call_id: req.call_id.clone(),
+                                                cseq: req.cseq.clone(),
+                                                contacts: Vec::new(),
+                                                headers: Vec::new(),
+                                                body: Vec::new(),
+                                            };
+                                            let wire = trying_resp.serialize();
+                                            let _ = celld::sip_transport::send_egress(&src_str, "udp", &wire).await;
+                                        }
+
+                                        let runtime_req = celld::engine_api::RuntimeSipRequest::from_request(
+                                            celld::engine_api::next_request_id(),
+                                            &req,
+                                        );
+                                        let (provisional_tx, mut provisional_rx) =
+                                            tokio::sync::mpsc::unbounded_channel::<celld::engine_api::RuntimeSipResponse>();
+                                        let src_str_clone = src_str.clone();
+                                        let req_clone = req.clone();
+                                        tokio::spawn(async move {
+                                            while let Some(prov) = provisional_rx.recv().await {
+                                                let prov_to_tag = if req_clone.to.tag.is_some() {
+                                                    None
+                                                } else {
+                                                    Some("celld-prov-tag")
+                                                };
+                                                if let Ok(resp_data) = prov.to_sip_response(&req_clone, prov_to_tag) {
+                                                    let wire = resp_data.serialize();
+                                                    let _ = celld::sip_transport::send_egress(&src_str_clone, "udp", &wire).await;
+                                                }
+                                            }
+                                        });
+
+                                        let runtime_inner = runtime_clone.clone();
+                                        let req_clone2 = req.clone();
+                                        tokio::spawn(async move {
+                                            if req_clone2.method == "ACK" {
+                                                let _ = runtime_inner.sip(None, runtime_req, Some(provisional_tx)).await;
+                                                return;
+                                            }
+                                            match runtime_inner.sip(None, runtime_req, Some(provisional_tx)).await {
+                                                Ok(resp) => {
+                                                    let resp_to_tag = if req_clone2.to.tag.is_some() {
+                                                        None
+                                                    } else {
+                                                        Some("celld-tag-1")
+                                                    };
+                                                    if let Ok(resp_data) = resp.to_sip_response(&req_clone2, resp_to_tag) {
+                                                        let wire = resp_data.serialize();
+                                                        let _ = celld::sip_transport::send_egress(&src_str, "udp", &wire).await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("error handling SIP request: {e}");
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::error!("SIP UDP recv error: {e}");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to bind SIP UDP listener on {bind_addr}: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Adopt the deployment `pointer` names.
 ///
 /// The same two calls boot makes -- `DeploymentGraph::load` and
@@ -876,6 +982,7 @@ async fn adopt_deployment(
         eager_classes: adopted.reserved_classes(),
     });
     spawn_cron_arm(app.clone());
+    spawn_sip_listeners(app.clone(), node.to_string());
     ReloadOutcome::Adopted {
         generation: adopted.id(),
         version: adopted.version().to_string(),
@@ -4058,6 +4165,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     crons,
                     containers: Vec::new(),
                     fence_image: None,
+                    sip: None,
                 }),
                 GenerationOptions {
                     node: node.clone(),
@@ -4675,6 +4783,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Arm the schedule, then watch the pointer. Adoption arms it again, so
     // a cron change travels with the deployment that carries it.
     spawn_cron_arm(app.clone());
+    spawn_sip_listeners(app.clone(), node.clone());
     if let Some(bucket) = deploy_bucket {
         start_pointer_watcher(
             app.clone(),

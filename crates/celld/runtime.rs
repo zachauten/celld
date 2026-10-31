@@ -909,6 +909,17 @@ impl RuntimeManager {
         });
     }
 
+    /// Dispatch one SIP request through the current generation's stateless isolate pool.
+    pub async fn sip(
+        &self,
+        entrypoint: Option<String>,
+        request: crate::engine_api::RuntimeSipRequest,
+        provisional_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::engine_api::RuntimeSipResponse>>,
+    ) -> anyhow::Result<crate::engine_api::RuntimeSipResponse> {
+        let generation = self.generation();
+        generation.stateless.sip(entrypoint, request, provisional_sender).await
+    }
+
     pub async fn fetch_worker(
         &self,
         url: String,
