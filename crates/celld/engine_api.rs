@@ -922,6 +922,8 @@ impl celld_logic::sip::DigestHasher for RealDigestHasher {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSipRequest {
     pub id: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_str: Option<String>,
     pub method: String,
     pub uri: String,
     pub version: String,
@@ -946,6 +948,7 @@ impl RuntimeSipRequest {
     pub fn from_request(id: RequestId, req: &celld_logic::sip::SipRequestData) -> Self {
         Self {
             id,
+            id_str: Some(id.to_string()),
             method: req.method.clone(),
             uri: req.uri.to_string(),
             version: req.version.clone(),

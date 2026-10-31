@@ -304,21 +304,22 @@
       }
       dto = dto || {};
 
-      this._requestId = dto.id != null ? dto.id : 0;
+      this.id = dto.id_str ? dto.id_str : (dto.id != null ? String(dto.id) : (dto._requestId != null ? String(dto._requestId) : "0"));
+      this._requestId = this.id;
       this.method = dto.method || "INVITE";
       this.uri = new SipUri(dto.uri || "sip:unknown");
       this.version = dto.version || "SIP/2.0";
-      this.callId = dto.call_id || "";
+      this.callId = dto.call_id || dto.callId || "";
       this.cseq = {
-        num: dto.cseq_num != null ? dto.cseq_num : 1,
-        method: dto.cseq_method || this.method,
+        num: dto.cseq_num != null ? dto.cseq_num : (dto.cseq && dto.cseq.num != null ? dto.cseq.num : 1),
+        method: dto.cseq_method || (dto.cseq && dto.cseq.method ? dto.cseq.method : this.method),
       };
       this.from = new SipNameAddr(dto.from || "sip:unknown");
       this.to = new SipNameAddr(dto.to || "sip:unknown");
       this.contacts = Array.isArray(dto.contacts)
         ? dto.contacts.map((c) => new SipContact(c))
         : [];
-      this.maxForwards = dto.max_forwards != null ? dto.max_forwards : 70;
+      this.maxForwards = dto.max_forwards != null ? dto.max_forwards : (dto.maxForwards != null ? dto.maxForwards : 70);
       this.expires = dto.expires != null ? dto.expires : null;
 
       this.headers = new Headers(dto.headers || []);
@@ -333,11 +334,36 @@
       }
 
       this.transport = {
-        protocol: dto.transport_protocol || "udp",
-        sourceAddress: dto.source_address || "",
-        destinationAddress: dto.destination_address || null,
-        nodeId: dto.node_id || "",
-        listenerId: dto.listener_id || null,
+        protocol: dto.transport_protocol || (dto.transport && dto.transport.protocol) || "udp",
+        sourceAddress: dto.source_address || (dto.transport && dto.transport.sourceAddress) || "",
+        destinationAddress: dto.destination_address || (dto.transport && dto.transport.destinationAddress) || null,
+        nodeId: dto.node_id || (dto.transport && dto.transport.nodeId) || "",
+        listenerId: dto.listener_id || (dto.transport && dto.transport.listenerId) || null,
+      };
+    }
+
+    toJSON() {
+      return {
+        id: this._requestId,
+        id_str: this._requestId,
+        method: this.method,
+        uri: this.uri.toString(),
+        version: this.version,
+        call_id: this.callId,
+        cseq_num: this.cseq.num,
+        cseq_method: this.cseq.method,
+        from: this.from.toString(),
+        to: this.to.toString(),
+        contacts: this.contacts.map((c) => c.toString()),
+        max_forwards: this.maxForwards,
+        expires: this.expires,
+        headers: Array.from(this.headers.entries()),
+        body: Array.from(this.body),
+        transport_protocol: this.transport.protocol,
+        source_address: this.transport.sourceAddress,
+        destination_address: this.transport.destinationAddress,
+        node_id: this.transport.nodeId,
+        listener_id: this.transport.listenerId,
       };
     }
 
