@@ -1271,6 +1271,7 @@ mod tests {
 
         let req = RuntimeSipRequest {
             id: 1001,
+            id_str: None,
             method: "OPTIONS".to_string(),
             uri: "sip:server@example.com".to_string(),
             version: "SIP/2.0".to_string(),
@@ -1338,6 +1339,7 @@ mod tests {
 
         let req = RuntimeSipRequest {
             id: 2002,
+            id_str: None,
             method: "INVITE".to_string(),
             uri: "sip:bob@example.com".to_string(),
             version: "SIP/2.0".to_string(),
@@ -1412,6 +1414,7 @@ mod tests {
         // Step 1: Unauthenticated request -> expect 401
         let req_unauth = RuntimeSipRequest {
             id: 3001,
+            id_str: None,
             method: "REGISTER".to_string(),
             uri: "sip:sip.example.com".to_string(),
             version: "SIP/2.0".to_string(),
@@ -1469,6 +1472,7 @@ mod tests {
 
         let req_auth = RuntimeSipRequest {
             id: 3002,
+            id_str: None,
             method: "REGISTER".to_string(),
             uri: "sip:sip.example.com".to_string(),
             version: "SIP/2.0".to_string(),
@@ -2061,6 +2065,7 @@ mod tests {
 
         let sip_req = RuntimeSipRequest {
             id: 4001,
+            id_str: None,
             method: "INVITE".to_string(),
             uri: "sip:call-center@sip.example.com".to_string(),
             version: "SIP/2.0".to_string(),

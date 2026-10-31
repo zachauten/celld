@@ -2312,7 +2312,7 @@ impl State {
                 self.cells.insert(id, cell);
                 continue;
             };
-            if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand {
+            if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand && !cell.confirming {
                 set_phase(
                     &mut self.occupied,
                     &mut cell,
@@ -3823,6 +3823,7 @@ impl State {
         if cell.requests.is_empty()
             && !cell.alarm_wake
             && !cell.resume_demand
+            && !cell.confirming
             && cell.phase == Phase::WaitingActivation
         {
             let start = cell.waiting_activation.take();
@@ -3838,6 +3839,7 @@ impl State {
         } else if cell.requests.is_empty()
             && !cell.alarm_wake
             && !cell.resume_demand
+            && !cell.confirming
             && cell.phase == Phase::WaitingCapacity
         {
             let activation = cell.waiting_for.take();
@@ -4613,7 +4615,7 @@ impl State {
             self.cells.insert(id.to_string(), cell);
             return;
         }
-        if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand {
+        if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand && !cell.confirming {
             // Every waiting request was cancelled during the backoff;
             // nothing demands the cell any more.
             cell.owner_log_recovery_attempts = 0;
